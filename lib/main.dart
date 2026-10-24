@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:flutter/services.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -27,83 +29,163 @@ class KineticMusicApp extends StatelessWidget {
 }
 
 /* =========================================================
- * 1. محرك توليد الصوت البرمجي (بدون ملفات خارجية)
+ * 1. محرك الصوت المحسّن للأندرويد (Karplus-Strong + WAV Cache)
  * ========================================================= */
 class SynthAudioEngine {
-  static const int sampleRate = 22050;
+  static const int sampleRate = 44100;
   final List<AudioPlayer> _pool = [];
   int _poolIndex = 0;
+  bool isMuted = false;
+  double masterVolume = 1.0;
+  bool _initialized = false;
 
-  final Map<String, Uint8List> _guitarCache = {};
-  final Map<String, Uint8List> _drumCache = {};
+  final Map<String, String> _fileCache = {};
+  final Map<String, Uint8List> _bytesCache = {};
 
   Future<void> init() async {
-    // إنشاء مجموعة مشغلات صوتية لدعم تعدد النغمات في نفس اللحظة (Polyphony)
-    for (int i = 0; i < 8; i++) {
+    if (_initialized) return;
+    _initialized = true;
+
+    // 1. ضبط إعدادات الصوت في أندرويد لعدم كتم النغمات المتداخلة
+    try {
+      await AudioPlayer.global.setAudioContext(
+        AudioContext(
+          android: const AudioContextAndroid(
+            isSpeakerphoneOn: true,
+            stayAwake: false,
+            contentType: AndroidContentType.sonification,
+            usageType: AndroidUsageType.game,
+            audioFocus: AndroidAudioFocus.none,
+          ),
+          iOS: AudioContextIOS(
+            category: AVAudioSessionCategory.playback,
+            options: const {AVAudioSessionOptions.mixWithOthers},
+          ),
+        ),
+      );
+    } catch (_) {}
+
+    // 2. إنشاء 12 مشغل صوتي متوازي للعزف السريع المتعدد
+    for (int i = 0; i < 12; i++) {
       final player = AudioPlayer();
-      await player.setPlayerMode(PlayerMode.lowLatency);
+      await player.setPlayerMode(PlayerMode.mediaPlayer);
+      await player.setReleaseMode(ReleaseMode.stop);
       _pool.add(player);
     }
 
-    // توليد أصوات الطبول مسبقاً في الذاكرة
-    _drumCache['kick'] = _generateDrumWav('kick');
-    _drumCache['snare'] = _generateDrumWav('snare');
-    _drumCache['hihat'] = _generateDrumWav('hihat');
-    _drumCache['tom'] = _generateDrumWav('tom');
-  }
+    // 3. تجهيز ملفات الطبول الأربعة وحفظها في الذاكرة المؤقتة
+    for (final drum in ['kick', 'snare', 'hihat', 'tom']) {
+      final bytes = _generateDrumWav(drum);
+      await _cacheWavToFile('drum_$drum', bytes);
+    }
 
-  void playGuitar(double freq, {double velocity = 0.85}) {
-    final key = freq.toStringAsFixed(1);
-    final wav = _guitarCache.putIfAbsent(key, () => _generateGuitarWav(freq));
-    _playBytes(wav, velocity.clamp(0.2, 1.0));
-  }
-
-  void playDrum(String type, {double velocity = 0.9}) {
-    final wav = _drumCache[type];
-    if (wav != null) {
-      _playBytes(wav, velocity.clamp(0.25, 1.0));
+    // 4. تجهيز نغمات الجيتار الأساسية مسبقاً لضمان سرعة الاستجابة
+    for (final tuning in kTunings.values) {
+      for (final note in tuning) {
+        await _ensureGuitarFreqCached(note.freq);
+        await _ensureGuitarFreqCached(note.freq * 1.5); // نغمة التوافقيات
+      }
     }
   }
 
-  void _playBytes(Uint8List bytes, double volume) {
+  Future<void> _ensureGuitarFreqCached(double freq) async {
+    final key = 'gtr_${freq.toStringAsFixed(1)}';
+    if (_fileCache.containsKey(key)) return;
+    final bytes = _generateGuitarWav(freq);
+    await _cacheWavToFile(key, bytes);
+  }
+
+  Future<void> _cacheWavToFile(String key, Uint8List bytes) async {
+    _bytesCache[key] = bytes;
+    try {
+      final dir = Directory.systemTemp;
+      final file = File('${dir.path}/kinetic_$key.wav');
+      if (!await file.exists()) {
+        await file.writeAsBytes(bytes, flush: true);
+      }
+      _fileCache[key] = file.path;
+    } catch (_) {
+      // في حال عدم توفر الكتابة المؤقتة سيتم التشغيل من الذاكرة مباشرة
+    }
+  }
+
+  Future<void> playGuitar(double freq, {double velocity = 0.9}) async {
+    if (isMuted || _pool.isEmpty) return;
+    final key = 'gtr_${freq.toStringAsFixed(1)}';
+    if (!_fileCache.containsKey(key) && !_bytesCache.containsKey(key)) {
+      await _ensureGuitarFreqCached(freq);
+    }
+    _playKey(key, (velocity * masterVolume).clamp(0.25, 1.0));
+  }
+
+  void playDrum(String type, {double velocity = 0.95}) {
+    if (isMuted || _pool.isEmpty) return;
+    final key = 'drum_$type';
+    _playKey(key, (velocity * masterVolume).clamp(0.3, 1.0));
+  }
+
+  Future<void> _playKey(String key, double volume) async {
     if (_pool.isEmpty) return;
     final player = _pool[_poolIndex];
     _poolIndex = (_poolIndex + 1) % _pool.length;
-    player.setVolume(volume);
-    player.play(BytesSource(bytes));
+
+    try {
+      await player.stop();
+      await player.setVolume(volume);
+      final filePath = _fileCache[key];
+      if (filePath != null) {
+        await player.play(DeviceFileSource(filePath));
+      } else if (_bytesCache.containsKey(key)) {
+        await player.play(BytesSource(_bytesCache[key]!));
+      }
+    } catch (_) {}
   }
 
-  // توليد موجة وتر الجيتار (رنين متناغم + نقرة الوتر)
+  // خوارزمية Karplus-Strong الفيزيائية لمحاكاة صوت وتر الجيتار الحقيقي
   Uint8List _generateGuitarWav(double freq) {
-    const double duration = 1.35;
+    const double duration = 1.45;
     final int numSamples = (sampleRate * duration).toInt();
     final Float64List samples = Float64List(numSamples);
+
+    final int delayLength = math.max(2, (sampleRate / freq).round());
+    final Float64List ringBuffer = Float64List(delayLength);
     final rng = math.Random(freq.toInt());
 
+    // شحن الوتر بنبضة غنية بالتوافقيات
+    for (int i = 0; i < delayLength; i++) {
+      final double phase = i / delayLength;
+      final double pluckShape = math.sin(2 * math.pi * phase);
+      final double noise = (rng.nextDouble() * 2.0 - 1.0);
+      ringBuffer[i] = pluckShape * 0.65 + noise * 0.35;
+    }
+
+    int bufIdx = 0;
     for (int i = 0; i < numSamples; i++) {
       final double t = i / sampleRate;
-      final double env = math.exp(-t * 3.4);
-      final double harmEnv = math.exp(-t * 7.5);
+      final int nextIdx = (bufIdx + 1) % delayLength;
 
-      // النغمة الأساسية + التوافقيات
-      double wave = math.sin(2 * math.pi * freq * t) * 0.65;
-      wave += math.sin(2 * math.pi * (freq * 2.0) * t) * 0.25 * harmEnv;
-      wave += math.sin(2 * math.pi * (freq * 3.0) * t) * 0.10 * harmEnv;
+      // مرشح تمرير منخفض داخل حلقة التغذية الراجعة للوتر
+      final double ksSample =
+          0.994 * 0.5 * (ringBuffer[bufIdx] + ringBuffer[nextIdx]);
+      ringBuffer[bufIdx] = ksSample;
+      bufIdx = nextIdx;
 
-      // صوت نقرة الوتر في البداية (Pluck transient)
-      if (t < 0.022) {
-        final double pluckEnv = math.exp(-t * 140);
-        wave += (rng.nextDouble() * 2 - 1) * 0.35 * pluckEnv;
-      }
+      // إضافة دفء صندوق الجيتار الخشبي (Body Resonance)
+      final double bodyEnv = math.exp(-t * 3.2);
+      final double bodyWave = math.sin(2 * math.pi * freq * t) * 0.45 * bodyEnv +
+          math.sin(2 * math.pi * (freq * 2.0) * t) * 0.18 * math.exp(-t * 5.5);
 
-      samples[i] = (wave * env).clamp(-1.0, 1.0);
+      final double fadeOut = math.exp(-t * 1.8);
+      samples[i] = ((ksSample * 0.75 + bodyWave) * fadeOut * 1.35)
+          .clamp(-0.98, 0.98);
     }
+
     return _encodeWav(samples);
   }
 
-  // توليد أصوات الطبول الأربعة
+  // توليد أصوات الطبول الأربعة بقوة ووضوح عاليين
   Uint8List _generateDrumWav(String type) {
-    final double duration = type == 'hihat' ? 0.14 : 0.36;
+    final double duration = type == 'hihat' ? 0.16 : 0.38;
     final int numSamples = (sampleRate * duration).toInt();
     final Float64List samples = Float64List(numSamples);
     final rng = math.Random(type.hashCode);
@@ -113,32 +195,41 @@ class SynthAudioEngine {
       double val = 0;
 
       if (type == 'kick') {
-        final double freq = 36 + 115 * math.exp(-t * 28);
-        final double env = math.exp(-t * 9.5);
-        val = math.sin(2 * math.pi * freq * t) * env * 0.95;
+        // طبلة الباص (Kick) مع نبضة عميقة واضحة على سماعات الهاتف
+        final double freq = 42 + 135 * math.exp(-t * 30);
+        final double env = math.exp(-t * 8.5);
+        final double punch =
+            math.sin(2 * math.pi * (freq * 2.0) * t) * math.exp(-t * 25) * 0.35;
+        val = (math.sin(2 * math.pi * freq * t) * env + punch) * 1.1;
       } else if (type == 'snare') {
-        final double toneEnv = math.exp(-t * 22);
-        final double noiseEnv = math.exp(-t * 14);
-        final double tone = math.sin(2 * math.pi * 165 * t) * toneEnv * 0.45;
-        final double noise = (rng.nextDouble() * 2 - 1) * noiseEnv * 0.65;
+        // طبلة السنير (Snare) مع سلك الرنين
+        final double toneEnv = math.exp(-t * 20);
+        final double noiseEnv = math.exp(-t * 13);
+        final double freq = 185 + 90 * math.exp(-t * 35);
+        final double tone = math.sin(2 * math.pi * freq * t) * toneEnv * 0.55;
+        final double noise = (rng.nextDouble() * 2 - 1) * noiseEnv * 0.75;
         val = tone + noise;
       } else if (type == 'hihat') {
-        final double env = math.exp(-t * 32);
-        final double metallic =
-            (rng.nextDouble() * 2 - 1) * math.sin(i * 0.65);
+        // الصنج المعدني (Hi-Hat)
+        final double env = math.exp(-t * 34);
+        final double metallic = (rng.nextDouble() * 2 - 1) *
+            (math.sin(2 * math.pi * 3400 * t) +
+                math.sin(2 * math.pi * 5100 * t) * 0.7);
         val = metallic * env * 0.65;
       } else if (type == 'tom') {
-        final double freq = 92 + 130 * math.exp(-t * 16);
-        final double env = math.exp(-t * 11);
-        val = math.sin(2 * math.pi * freq * t) * env * 0.85;
+        // طبلة التوم (Tom)
+        final double freq = 105 + 140 * math.exp(-t * 15);
+        final double env = math.exp(-t * 9.5);
+        val = math.sin(2 * math.pi * freq * t) * env * 0.95;
       }
 
-      samples[i] = val.clamp(-1.0, 1.0);
+      samples[i] = val.clamp(-0.98, 0.98);
     }
+
     return _encodeWav(samples);
   }
 
-  // تحويل الإشارة الرقمية إلى ملف WAV صالح للتشغيل في الذاكرة
+  // تحويل الإشارة الصوتية إلى صيغة WAV قياسية 16-bit
   Uint8List _encodeWav(Float64List samples) {
     final int dataSize = samples.length * 2;
     final ByteData buffer = ByteData(44 + dataSize);
@@ -153,8 +244,8 @@ class SynthAudioEngine {
     buffer.setUint32(4, 36 + dataSize, Endian.little);
     writeString(8, 'WAVE');
     writeString(12, 'fmt ');
-    buffer.setUint32(16, 16, Endian.little); // PCM chunk size
-    buffer.setUint16(20, 1, Endian.little); // PCM format
+    buffer.setUint32(16, 16, Endian.little);
+    buffer.setUint16(20, 1, Endian.little); // PCM
     buffer.setUint16(22, 1, Endian.little); // Mono
     buffer.setUint32(24, sampleRate, Endian.little);
     buffer.setUint32(28, sampleRate * 2, Endian.little);
@@ -268,7 +359,7 @@ class GuitarStringModel {
 class DrumShapeModel {
   final String id;
   final String label;
-  final String shape; // circle, triangle, diamond, hexagon
+  final String shape;
   double xRatio;
   double yRatio;
   final double radius;
@@ -327,7 +418,7 @@ class SoundRipple {
 }
 
 class SheetNoteModel {
-  final String kind; // 'guitar' or 'drum'
+  final String kind;
   final String? drumType;
   final String note;
   final double freq;
@@ -365,6 +456,7 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
 
   String _currentTuning = 'pentatonic';
   bool _flowActive = true;
+  bool _audioReady = false;
   Size _stageSize = Size.zero;
 
   final List<GuitarStringModel> _strings = [];
@@ -374,7 +466,6 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
   final List<SheetNoteModel> _sheetNotes = [];
   final List<Offset> _pointerTrail = [];
 
-  // حالة اللمس والسحب
   Offset? _lastPointer;
   DrumShapeModel? _draggingDrum;
   GuitarStringModel? _draggingNode;
@@ -385,9 +476,16 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
   @override
   void initState() {
     super.initState();
-    _audio.init();
     _initInstrumentEntities();
+    _initAudioAsync();
     _ticker = createTicker(_onTick)..start();
+  }
+
+  Future<void> _initAudioAsync() async {
+    await _audio.init();
+    if (mounted) {
+      setState(() => _audioReady = true);
+    }
   }
 
   void _initInstrumentEntities() {
@@ -470,6 +568,25 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
     });
   }
 
+  // زر اختبار سريع للصوت بعزف كورد على الأوتار والطبول
+  void _testSoundChord() {
+    if (_stageSize == Size.zero) return;
+    for (int i = 0; i < _strings.length; i++) {
+      Timer(Duration(milliseconds: i * 95), () {
+        if (!mounted) return;
+        _pluckString(
+          _strings[_strings.length - 1 - i],
+          _stageSize.width * 0.5,
+          0.95,
+        );
+      });
+    }
+    Timer(const Duration(milliseconds: 620), () {
+      if (!mounted) return;
+      _triggerDrum(_drums[0], 0.95); // Kick
+    });
+  }
+
   void _spawnOrb({double? x, double? y}) {
     if (_stageSize == Size.zero) return;
     final rng = math.Random();
@@ -488,7 +605,6 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
   void _onTick(Duration elapsed) {
     if (_stageSize == Size.zero) return;
 
-    // 1. تحديث اهتزاز الأوتار
     for (final s in _strings) {
       if (s.cooldown > 0) s.cooldown--;
       if (s.nodePulse > 0) s.nodePulse *= 0.92;
@@ -500,18 +616,16 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
       }
     }
 
-    // 2. تحديث دوران ونبض أشكال الطبول
     for (final d in _drums) {
       d.pulse *= 0.90;
       d.angle += 0.005 + d.pulse * 0.04;
     }
 
-    // 3. تحديث الكرات الحركية وفحص تقاطعها مع الأوتار والأشكال
     final padX = _stageSize.width * 0.06;
     const padY = 22.0;
 
     for (final orb in _orbs) {
-      if (_flowActive) {
+      if (_flowActive && _audioReady) {
         orb.prevX = orb.x;
         orb.prevY = orb.y;
         orb.x += orb.vx;
@@ -534,6 +648,7 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
           orb.y,
           speed * 3.0,
           orb.shapeCooldowns,
+          fromUser: false,
         );
       }
 
@@ -541,7 +656,6 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
       if (orb.trail.length > 20) orb.trail.removeAt(0);
     }
 
-    // 4. تحديث الموجات البصرية
     for (int i = _ripples.length - 1; i >= 0; i--) {
       final rp = _ripples[i];
       rp.r += (rp.maxR - rp.r) * 0.14;
@@ -551,7 +665,6 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
       }
     }
 
-    // 5. تحديث ظهور النوتات الموسيقية
     for (final n in _sheetNotes) {
       if (n.alpha < 1.0) {
         n.alpha = (n.alpha + 0.12).clamp(0.0, 1.0);
@@ -561,7 +674,12 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
     setState(() {});
   }
 
-  void _pluckString(GuitarStringModel s, double xPos, double velocity) {
+  void _pluckString(
+    GuitarStringModel s,
+    double xPos,
+    double velocity, {
+    bool fromUser = true,
+  }) {
     if (s.cooldown > 0 || _stageSize == Size.zero) return;
     s.cooldown = 7;
     s.pluckX = (xPos / _stageSize.width).clamp(0.08, 0.92);
@@ -576,6 +694,9 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
     final label = nearNode ? '${s.note}*' : s.note;
 
     _audio.playGuitar(freq, velocity: velocity);
+    if (fromUser) {
+      HapticFeedback.selectionClick();
+    }
 
     _ripples.add(
       SoundRipple(
@@ -599,10 +720,17 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
     );
   }
 
-  void _triggerDrum(DrumShapeModel d, double velocity) {
+  void _triggerDrum(
+    DrumShapeModel d,
+    double velocity, {
+    bool fromUser = true,
+  }) {
     if (_stageSize == Size.zero) return;
     d.pulse = 1.0;
     _audio.playDrum(d.id, velocity: velocity);
+    if (fromUser) {
+      HapticFeedback.lightImpact();
+    }
 
     _ripples.add(
       SoundRipple(
@@ -640,31 +768,30 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
     double x2,
     double y2,
     double speed,
-    Map<String, int> cooldownMap,
-  ) {
+    Map<String, int> cooldownMap, {
+    bool fromUser = true,
+  }) {
     final w = _stageSize.width;
     final h = _stageSize.height;
     final leftPad = w * 0.06;
     final rightPad = w * 0.94;
 
-    // عبور أوتار الجيتار أو العقد البلورية عليها
     for (final s in _strings) {
       final sy = s.yRatio * h;
       final crossed = (y1 <= sy && y2 >= sy) || (y1 >= sy && y2 <= sy);
       if (crossed && x2 >= leftPad && x2 <= rightPad) {
-        final vel = (speed / 14).clamp(0.35, 1.0);
-        _pluckString(s, x2, vel);
+        final vel = (speed / 14).clamp(0.45, 1.0);
+        _pluckString(s, x2, vel, fromUser: fromUser);
       } else {
         final nx = s.nodeXRatio * w;
         final dPrev = math.sqrt(math.pow(x1 - nx, 2) + math.pow(y1 - sy, 2));
         final dNow = math.sqrt(math.pow(x2 - nx, 2) + math.pow(y2 - sy, 2));
         if (dPrev > 20 && dNow <= 20) {
-          _pluckString(s, nx, 0.95);
+          _pluckString(s, nx, 0.95, fromUser: fromUser);
         }
       }
     }
 
-    // المرور عبر الأشكال الهندسية للطبول
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     for (final d in _drums) {
       final dx = d.xRatio * w;
@@ -676,8 +803,8 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
       final lastHit = cooldownMap[d.id] ?? 0;
       if (dPrev > hitRadius && dNow <= hitRadius && (nowMs - lastHit) > 130) {
         cooldownMap[d.id] = nowMs;
-        final vel = (speed / 12).clamp(0.45, 1.0);
-        _triggerDrum(d, vel);
+        final vel = (speed / 12).clamp(0.55, 1.0);
+        _triggerDrum(d, vel, fromUser: fromUser);
       }
     }
   }
@@ -693,33 +820,30 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
     final w = _stageSize.width;
     final h = _stageSize.height;
 
-    // فحص الضغط على أحد أشكال الطبول
     for (final d in _drums) {
       final dx = d.xRatio * w;
       final dy = d.yRatio * h;
-      if ((pt - Offset(dx, dy)).distance <= d.radius + 8) {
+      if ((pt - Offset(dx, dy)).distance <= d.radius + 10) {
         _draggingDrum = d;
-        _triggerDrum(d, 0.92);
+        _triggerDrum(d, 0.95, fromUser: true);
         return;
       }
     }
 
-    // فحص الضغط على العقدة البلورية على الوتر
     for (final s in _strings) {
       final nx = s.nodeXRatio * w;
       final ny = s.yRatio * h;
-      if ((pt - Offset(nx, ny)).distance <= 18) {
+      if ((pt - Offset(nx, ny)).distance <= 20) {
         _draggingNode = s;
-        _pluckString(s, nx, 0.95);
+        _pluckString(s, nx, 0.98, fromUser: true);
         return;
       }
     }
 
-    // فحص الضغط المباشر على وتر
     for (final s in _strings) {
       final sy = s.yRatio * h;
-      if ((pt.dy - sy).abs() <= 12 && pt.dx >= w * 0.06 && pt.dx <= w * 0.94) {
-        _pluckString(s, pt.dx, 0.85);
+      if ((pt.dy - sy).abs() <= 14 && pt.dx >= w * 0.06 && pt.dx <= w * 0.94) {
+        _pluckString(s, pt.dx, 0.90, fromUser: true);
         return;
       }
     }
@@ -749,7 +873,7 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
       return;
     }
 
-    if (speed > 1.2) {
+    if (speed > 1.0) {
       _checkMotionInteractions(
         prev.dx,
         prev.dy,
@@ -757,6 +881,7 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
         pt.dy,
         speed,
         _pointerCooldowns,
+        fromUser: true,
       );
     }
   }
@@ -765,7 +890,7 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
     final pt = e.localPosition;
     if (_draggingDrum == null && _draggingNode == null && _movedDistance < 10) {
       final onString = _strings.any(
-        (s) => (pt.dy - s.yRatio * _stageSize.height).abs() <= 12,
+        (s) => (pt.dy - s.yRatio * _stageSize.height).abs() <= 14,
       );
       if (!onString) {
         _spawnOrb(x: pt.dx, y: pt.dy);
@@ -792,9 +917,9 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
       final timer = Timer(Duration(milliseconds: i * 190), () {
         n.alpha = 0.25;
         if (n.kind == 'guitar') {
-          _audio.playGuitar(n.freq, velocity: 0.85);
+          _audio.playGuitar(n.freq, velocity: 0.90);
         } else if (n.drumType != null) {
-          _audio.playDrum(n.drumType!, velocity: 0.9);
+          _audio.playDrum(n.drumType!, velocity: 0.95);
         }
       });
       _replayTimers.add(timer);
@@ -817,7 +942,6 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
       body: SafeArea(
         child: Column(
           children: [
-            // المسرح التفاعلي للأوتار والطبول
             Expanded(
               child: LayoutBuilder(
                 builder: (context, constraints) {
@@ -825,7 +949,6 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
                       Size(constraints.maxWidth, constraints.maxHeight);
                   if (_stageSize == Size.zero && newSize != Size.zero) {
                     _stageSize = newSize;
-                    // إضافة كرتين حركيتين عند بدء التشغيل
                     WidgetsBinding.instance.addPostFrameCallback((_) {
                       if (_orbs.isEmpty) {
                         _spawnOrb(
@@ -860,17 +983,13 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
                           ),
                         ),
                       ),
-
-                      // شريط التحكم العلوي المصغر
                       Align(
                         alignment: Alignment.topCenter,
                         child: Padding(
-                          padding: const EdgeInsets.only(top: 12),
+                          padding: const EdgeInsets.only(top: 10),
                           child: _buildMinimalHud(),
                         ),
                       ),
-
-                      // نص إرشادي خفيف أسفل المسرح
                       const Align(
                         alignment: Alignment.bottomCenter,
                         child: Padding(
@@ -892,8 +1011,6 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
                 },
               ),
             ),
-
-            // شريط النوتة الموسيقية الحية في الأسفل
             Container(
               height: 175,
               width: double.infinity,
@@ -933,9 +1050,9 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
 
   Widget _buildMinimalHud() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: BoxDecoration(
-        color: const Color(0xFF14161C).withOpacity(0.85),
+        color: const Color(0xFF14161C).withOpacity(0.88),
         borderRadius: BorderRadius.circular(999),
         border: Border.all(color: Colors.white12),
       ),
@@ -969,6 +1086,20 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
             _flowActive,
           ),
           _buildHudChip('Clear Orbs', () => _orbs.clear(), false),
+          Container(width: 1, height: 14, color: Colors.white12),
+          // زر اختبار الصوت المباشر
+          _buildHudChip('🔊 اختبار الصوت', _testSoundChord, true),
+          // زر كتم / تشغيل الصوت
+          GestureDetector(
+            onTap: () => setState(() => _audio.isMuted = !_audio.isMuted),
+            child: Icon(
+              _audio.isMuted ? Icons.volume_off : Icons.volume_up,
+              size: 17,
+              color: _audio.isMuted
+                  ? Colors.redAccent
+                  : const Color(0xFFFFD19B),
+            ),
+          ),
         ],
       ),
     );
@@ -978,7 +1109,7 @@ class _KineticInstrumentScreenState extends State<KineticInstrumentScreen>
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
         decoration: BoxDecoration(
           color: active
               ? const Color(0xFFF2A65A).withOpacity(0.2)
@@ -1045,7 +1176,6 @@ class StagePainter extends CustomPainter {
     final leftX = w * 0.06;
     final rightX = w * 0.94;
 
-    // 1. رسم الأوتار الستة مع الفيزياء الاهتزازية
     for (final s in strings) {
       final sy = s.yRatio * h;
       final displacement = math.sin(s.phase) * s.amp;
@@ -1061,7 +1191,8 @@ class StagePainter extends CustomPainter {
       final activeGlow = (s.amp / 15.0).clamp(0.0, 1.0);
       final paint = Paint()
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.4 + (strings.length - s.index) * 0.22 + activeGlow * 1.5
+        ..strokeWidth =
+            1.4 + (strings.length - s.index) * 0.22 + activeGlow * 1.5
         ..color = activeGlow > 0.05
             ? s.color
             : const Color(0xFFE8E6DF).withOpacity(0.28);
@@ -1078,7 +1209,6 @@ class StagePainter extends CustomPainter {
       }
       canvas.drawPath(path, paint);
 
-      // كتابة اسم النغمة على يسار الوتر
       final tp = TextPainter(
         text: TextSpan(
           text: s.note,
@@ -1092,7 +1222,6 @@ class StagePainter extends CustomPainter {
       )..layout();
       tp.paint(canvas, Offset(leftX - tp.width - 8, sy - tp.height / 2));
 
-      // العقدة الهندسية على الوتر
       final nodeX = s.nodeXRatio * w;
       final nodeY = sy + displacement * 0.5;
       final nodePath = _createPolygonPath(
@@ -1112,7 +1241,6 @@ class StagePainter extends CustomPainter {
       );
     }
 
-    // 2. رسم الأشكال الهندسية للطبول
     for (final d in drums) {
       final dx = d.xRatio * w;
       final dy = d.yRatio * h;
@@ -1123,7 +1251,8 @@ class StagePainter extends CustomPainter {
         shapePath = Path()
           ..addOval(Rect.fromCircle(center: Offset(dx, dy), radius: r));
       } else if (d.shape == 'triangle') {
-        shapePath = _createPolygonPath(dx, dy, r * 1.12, 3, d.angle - math.pi / 2);
+        shapePath =
+            _createPolygonPath(dx, dy, r * 1.12, 3, d.angle - math.pi / 2);
       } else if (d.shape == 'diamond') {
         shapePath = _createPolygonPath(dx, dy, r * 1.08, 4, d.angle);
       } else {
@@ -1168,7 +1297,6 @@ class StagePainter extends CustomPainter {
       tp.paint(canvas, Offset(dx - tp.width / 2, dy - tp.height / 2));
     }
 
-    // 3. رسم الكرات الحركية ومسارها المضيء
     for (final orb in orbs) {
       for (int i = 1; i < orb.trail.length; i++) {
         final ratio = i / orb.trail.length;
@@ -1196,7 +1324,6 @@ class StagePainter extends CustomPainter {
       );
     }
 
-    // 4. رسم مسار اللمس
     for (int i = 1; i < pointerTrail.length; i++) {
       final ratio = i / pointerTrail.length;
       canvas.drawLine(
@@ -1208,7 +1335,6 @@ class StagePainter extends CustomPainter {
       );
     }
 
-    // 5. رسم الموجات الصوتية المتسعة
     for (final rp in ripples) {
       canvas.drawCircle(
         Offset(rp.x, rp.y),
@@ -1261,7 +1387,6 @@ class SheetMusicPainter extends CustomPainter {
     const staffLeft = 52.0;
     final staffRight = sw - 18.0;
 
-    // 1. رسم خطوط المدرج الموسيقي الخمسة
     final linePaint = Paint()
       ..color = const Color(0xFFE8E6DF).withOpacity(0.18)
       ..strokeWidth = 1;
@@ -1271,7 +1396,6 @@ class SheetMusicPainter extends CustomPainter {
       canvas.drawLine(Offset(16, y), Offset(staffRight, y), linePaint);
     }
 
-    // خط الإيقاع السفلي للطبول
     final bassLineY = bottomLineY + lineSpacing * 2.1;
     canvas.drawLine(
       Offset(16, bassLineY),
@@ -1281,7 +1405,6 @@ class SheetMusicPainter extends CustomPainter {
         ..strokeWidth = 1,
     );
 
-    // مفتاح صول الموسيقي (Treble Clef)
     final clefPainter = TextPainter(
       text: const TextSpan(
         text: '𝄞',
@@ -1294,7 +1417,6 @@ class SheetMusicPainter extends CustomPainter {
       Offset(22, bottomLineY - lineSpacing * 3.6),
     );
 
-    // حساب عدد النوتات الظاهرة حسب عرض شاشة الهاتف
     const noteSpacing = 34.0;
     final maxVisible =
         math.max(6, ((staffRight - staffLeft - 20) / noteSpacing).floor());
@@ -1302,14 +1424,12 @@ class SheetMusicPainter extends CustomPainter {
         ? notes.sublist(notes.length - maxVisible)
         : notes;
 
-    // 2. رسم كل نوتة موسيقية على المدرج
     for (int i = 0; i < visibleNotes.length; i++) {
       final n = visibleNotes[i];
       final x = staffLeft + 18 + i * noteSpacing;
       final y = bottomLineY - n.step * stepSpacing;
       final color = n.color.withOpacity(n.alpha.clamp(0.0, 1.0));
 
-      // خطوط إضافية للنوتات المنخفضة (Ledger lines)
       if (n.kind == 'guitar' && n.step <= -2) {
         for (int st = -2; st >= n.step; st -= 2) {
           final ly = bottomLineY - st * stepSpacing;
@@ -1332,7 +1452,6 @@ class SheetMusicPainter extends CustomPainter {
         ..style = PaintingStyle.fill;
 
       if (n.kind == 'guitar') {
-        // رأس النوتة البيضاوي المائل
         canvas.save();
         canvas.translate(x, y);
         canvas.rotate(-0.3);
@@ -1342,14 +1461,12 @@ class SheetMusicPainter extends CustomPainter {
         );
         canvas.restore();
 
-        // ساق النوتة (Stem)
         if (n.step < 4) {
           canvas.drawLine(Offset(x + 5, y), Offset(x + 5, y - 26), strokePaint);
         } else {
           canvas.drawLine(Offset(x - 5, y), Offset(x - 5, y + 26), strokePaint);
         }
       } else {
-        // تدوين الطبول (X للهاي هات، معين للسنير والتوم، دائرة للكيك)
         if (n.drumType == 'hihat') {
           const sz = 4.5;
           canvas.drawLine(
@@ -1373,7 +1490,6 @@ class SheetMusicPainter extends CustomPainter {
         }
       }
 
-      // اسم النغمة أسفل المدرج
       final labelTp = TextPainter(
         text: TextSpan(
           text: n.note,
@@ -1405,4 +1521,3 @@ class SheetMusicPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant SheetMusicPainter oldDelegate) => true;
 }
-
