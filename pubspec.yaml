@@ -1,5 +1,5 @@
-name: flutter_termux_app
-description: "A new Flutter project built via GitHub Actions."
+name: kinetic_music_app
+description: "Kinetic Guitar & Drums App"
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -9,6 +9,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  audioplayers: ^6.0.0
   cupertino_icons: ^1.0.6
 
 dev_dependencies:
